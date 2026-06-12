@@ -1,0 +1,267 @@
+---
+title: "Inference"
+bibliography: references.bib
+---
+
+```{r }
+#| label: setup
+#| echo: false
+#| message: false
+#| 
+library(here)
+library(purrr)
+
+source(here('scripts', 'setup.R'), echo=F)
+# Set seed for reproducibility
+set.seed(42)
+
+dta_c_panel = readRDS(here('dta', 'dta_cloned_panel.Rds')) %>%
+  dplyr::filter(model == 'ay')
+```
+
+# Uncertainty estimates
+
+Several steps in the analysis make the assumptions of conventional standard errors invalid. Cloning or repeated use of persons across sequential target trial dates complicates the statistical properties of the estimand (due to correlated data), additionally the added uncertainty in estimation of probability weights must be accounted for.
+
+Currently, most researchers are using bootstrapping to obtain confidence limits via percentile method. It is critical that: 1. The bootstrapping step occur prior to sequential repeated sampling, cloning or estimation of weights 2. The bootstrap sampling with replacement must be at the cluster-level (person).
+
+Also consider, bootstrapping may fail to produce valid estimates in cases of matching procedures, or penalized regression procedures.[@camponovo2015][@abadie2008] Other bootstrapping failures may arise due to limited sample size or values on the boundary of a parameter space.
+
+## Bootstrapping
+
+::: callout-note
+A Bayesian bootstrap procedure is used here, see:[Bootstrap methods](app_02_boot.qmd) for some notes on this. 
+:::
+
+Bootstrapping is fairly straightforward, but for specific projects the procedure may need to be modified because of computing resources. Here we execute the entire procedure in one step, but it may make sense for your project to generate a single bootstrapped data first, then run each estimation step sequentially and store the results in a file before executing the next one. This would make sense if 1) one bootstrap takes a very long time, 2) there is a decent chance that the procedure may be interrupted (like a cloud server cuts off user etc.). 
+
+The function generates a continuous frequency weight from a random exponent distribution with rate=1, also known as Bayesian bootstrap. This weight is used through the IPW estimation and outcome model steps. 
+
+```{r }
+#| label: boot-func
+#| message: false
+#| warning: false
+boot_ipw = function(x, point=F, stab=T) {
+  
+ setDT(x)
+  
+  i_list = distinct(x, id) %>%
+  mutate(prior = rexp(n=n(), rate=1), # <1>
+         freqwt = prior / sum(prior)) # <1>
+
+  
+  x = inner_join(x, i_list, by = 'id')
+
+  if (point) x$freqwt = 1 # Option to get non-bootstrapped est
+  
+  dta_cens = x[x$assign==0, ]
+
+# assign == 0
+  d_glm_cwt_num = glm(treat ~ poly(time, 2, raw=T), data=dta_cens, weights = freqwt, family=binomial()) # <2>
+  
+  d_glm_cwt_den = glm(treat ~ poly(time, 2, raw=T) + X + X_t + poly(age, 2) + female, data=dta_cens, weights = freqwt, family=binomial()) # <2>
+
+  x$pr_cens_num = predict(d_glm_cwt_num, newdata = x, type='response') 
+  x$pr_cens_den = predict(d_glm_cwt_den, newdata = x, type='response') 
+  
+  dta_cens_grace = dta_cens %>% 
+      dplyr::filter(time==12 & t_treat>=12) 
+  
+  d_glm_grace_num = glm(treat ~ 1, data=dta_cens_grace, weights = freqwt, family=binomial()) # <2>
+  
+  d_glm_grace_den = glm(treat ~ X + X_t + poly(age, 2) + female, data=dta_cens_grace, weights = freqwt, family=binomial()) # <2>
+  
+  x$pr_grace_num = predict(d_glm_grace_num, newdata = x, type='response') 
+  x$pr_grace_den = predict(d_glm_grace_den, newdata = x, type='response') 
+  
+setDT(x)
+  
+  x[, ipw := fcase(
+    assign==0, 1 / (1-pr_cens_den), 
+    assign==0 & censor==1, 0, 
+    assign==1 & censor==1, 0, 
+    assign==1 & time < 12, 1, 
+    assign==1 & time == 12  & t_treat  < 12, 1, 
+    assign==1 & time == 12  & t_treat  >=12, 1 / (pr_grace_den), 
+    assign==1 & time > 12, 1, 
+    assign==1 & censor==1, 0
+  )]
+  
+x[, marg_c0  := 1-mean(censor), by = list(assign, time)] 
+
+x[, marg_ipw := fcase(
+    assign==0, (marg_c0) / (1-pr_cens_den), 
+    assign==0 & censor==1, 0, 
+    assign==1 & censor==1, 0, 
+    assign==1 & time < 12, 1, 
+    assign==1 & time == 12  & t_treat  < 12, 1, 
+    assign==1 & time == 12  & t_treat  >=12, marg_c0 / (pr_grace_den), 
+    assign==1 & time > 12, 1, 
+    assign==1 & censor==1, 0
+  )]
+  
+  x[, `:=`(ipw = cumprod(ipw), 
+                     marg_ipw = cumprod(marg_ipw)), 
+               by=list(id, assign)] 
+
+  if (stab) x[, ipw := marg_ipw]
+  
+  d_glm_pe_1 = glm(event==0 ~ poly(time, 2, raw=T), # <3>
+                   data=x[x$assign==1, ], # <3>
+                   family=binomial(), weights = ipw*freqwt) # <3>
+  
+  d_glm_pe_0 = glm(event==0 ~ poly(time, 2, raw=T), # <3>
+                   data=x[x$assign==0, ], # <3>
+                     family=binomial(), weights = ipw*freqwt) # <3>
+  
+  x$pr_1 = predict(d_glm_pe_1, newdata = x, 
+                             type='response') 
+  x$pr_0 = predict(d_glm_pe_0, newdata = x, 
+                             type='response') 
+  
+  x[, `:=`(pr_cum_1 = cumprod(pr_1)), by=list(id, assign)] 
+  x[, `:=`(pr_cum_0 = cumprod(pr_0)), by=list(id, assign)] 
+  
+  d_res = x %>% 
+    group_by(time) %>% 
+    summarize(pr_ev_1 = weighted.mean(1-pr_cum_1, freqwt), # <4>
+              pr_ev_0 = weighted.mean(1-pr_cum_0, freqwt), # <4>
+              .groups = 'drop') %>%
+    ungroup %>% 
+    mutate(cid = pr_ev_1 - pr_ev_0, 
+           cir = pr_ev_1 / pr_ev_0) 
+  
+  return(d_res)
+}
+```
+1. The Bayesian bootstrap is a continuous measure of the number of times (versus a count) that observation would have appeared in a dataset resampled with equal size and replacement (i.e. on average would appear 1 time). 
+2. Note the `freqwt` used in the `glm()` procedure.
+3. Note the `freqwt*ipw` used in the `glm()` procedure.
+4. Note the use of `weighted.mean()` and `freqwt`. 
+
+The function can be run iteratively, with `replicate()` or purrr/furrr or many other options. 
+
+```{r }
+#| label: boot-ests
+#| message: false
+#| warning: false
+
+library(furrr)
+boots = 50
+plan(multisession, workers = 10) # <1>
+
+d_pe = boot_ipw(dta_c_panel, point=T, stab = F) # <2>
+
+d_boot = future_map(1:boots, 
+                        function(x) boot_ipw(dta_c_panel, stab=F), 
+                        .options = furrr_options(seed=T)) # <3>
+```
+
+1. Set 10 CPU workers for parallel computation
+2. Obtain point estimates first (no bootstrapping)
+3. Run bootstraps in parallel, note the `furrr_options(seed=T)` is important because of the RNG functions and is needed to ensure reproducibility and some funny quirks of generating random numbers in parallel. See `furrr` for explanation.  
+
+After the bootstraps, summarizing is straightforward as well:
+
+```{r }
+#| label: boot-summ
+#| message: false
+#| warning: false
+#| 
+lci_q = 0.025 # <1>
+uci_q = 0.975 # <1>
+
+d_summ = d_boot %>%
+  bind_rows(., .id = 'boot') %>%
+  group_by(time) %>%
+  summarize(n_boots = n(),
+            pr_ev_1_lci = quantile(pr_ev_1, lci_q),
+            pr_ev_1_uci = quantile(pr_ev_1, uci_q),
+            pr_ev_0_lci = quantile(pr_ev_0, lci_q),
+            pr_ev_0_uci = quantile(pr_ev_0, uci_q),
+            cid_lci = quantile(cid, lci_q),
+            cid_uci = quantile(cid, uci_q),
+            cir_lci = quantile(cir, lci_q),
+            cir_uci = quantile(cir, uci_q)
+            ) %>%
+  inner_join(., d_pe, by='time') # <2>
+```
+
+1. percentile intervals are specified at the conventional points (95%). However any of the typical bootstrapped confidence procedures can be done at this point. 
+2. Joining the computed intervals back with point estimates.  
+
+```{r }
+#| label: boot-tab
+#| tbl-cap: "IPW-adjusted cumulative incidences, differences and relative risks"
+#| tbl-cap-location: top
+#| message: false
+#| warning: false
+#| echo: false
+d_summ %>%
+  dplyr::filter(time %in% c(12, 24, 60)) %>%
+  mutate_all(., ~sprintf('%1.2f', .)) %>%
+  mutate(`Assign=1` = paste0(pr_ev_1, ' (', pr_ev_1_lci, ', ', pr_ev_1_uci, ')'),
+         `Assign=0` = paste0(pr_ev_0, ' (', pr_ev_0_lci, ', ', pr_ev_0_uci, ')'),
+         `CID` = paste0(cid, ' (', cid_lci, ', ', cid_uci, ')'),
+         `RR` = paste0(cir, ' (', cir_lci, ', ', cir_uci, ')')) %>%
+  select(time, `Assign=1`, `Assign=0`, CID, RR) %>%
+  kable(., align = 'c', digits=3) %>%
+  kable_styling()
+```
+
+You would expect that the stabilized weights provide similar estimates but narrower confidence intervals: 
+
+```{r }
+#| label: boot-stab-tab
+#| tbl-cap: "Stabilized IPW-adjusted cumulative incidences, differences and relative risks"
+#| tbl-cap-location: top
+#| message: false
+#| warning: false
+#| echo: false
+boots = 50
+plan(multisession, workers = 10) # <1>
+
+d_pe = boot_ipw(dta_c_panel, point=T, stab = T) # <2>
+
+d_boot = future_map(1:boots, 
+                        function(x) boot_ipw(dta_c_panel, stab=T), 
+                        .options = furrr_options(seed=T)) # <3>
+
+lci_q = 0.025 # <1>
+uci_q = 0.975 # <1>
+
+d_summ = d_boot %>%
+  bind_rows(., .id = 'boot') %>%
+  group_by(time) %>%
+  summarize(n_boots = n(),
+            pr_ev_1_lci = quantile(pr_ev_1, lci_q),
+            pr_ev_1_uci = quantile(pr_ev_1, uci_q),
+            pr_ev_0_lci = quantile(pr_ev_0, lci_q),
+            pr_ev_0_uci = quantile(pr_ev_0, uci_q),
+            cid_lci = quantile(cid, lci_q),
+            cid_uci = quantile(cid, uci_q),
+            cir_lci = quantile(cir, lci_q),
+            cir_uci = quantile(cir, uci_q)
+            ) %>%
+  inner_join(., d_pe, by='time') # <2>
+
+d_summ %>%
+  dplyr::filter(time %in% c(12, 24, 60)) %>%
+  mutate_all(., ~sprintf('%1.2f', .)) %>%
+  mutate(`Assign=1` = paste0(pr_ev_1, ' (', pr_ev_1_lci, ', ', pr_ev_1_uci, ')'),
+         `Assign=0` = paste0(pr_ev_0, ' (', pr_ev_0_lci, ', ', pr_ev_0_uci, ')'),
+         `CID` = paste0(cid, ' (', cid_lci, ', ', cid_uci, ')'),
+         `RR` = paste0(cir, ' (', cir_lci, ', ', cir_uci, ')')) %>%
+  select(time, `Assign=1`, `Assign=0`, CID, RR) %>%
+  kable(., align = 'c', digits=3) %>%
+  kable_styling()
+```
+## Influence statistics
+
+Under development...
+
+# References
+
+::: {#refs}
+
+:::

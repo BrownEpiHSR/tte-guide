@@ -1,0 +1,62 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "Trial by Emulation"
+  reader-mode: true
+  
+  page-footer:
+    left: |
+      Trial by Emulation (1e) was written by Kevin W. McConeghy, 
+    right: |
+      This book was built with <a href="https://quarto.org/">Quarto</a>.
+    background: "#D9E3E4"
+
+  site-url: "https://BrownEpiHSR.github.io/tte-guide/qmd/"
+  repo-url: "https://github.com/BrownEpiHSR/tte-guide"
+  repo-actions: [edit, issue]
+  
+  announcement: 
+    icon: info-circle
+    dismissable: true
+    content: "**Alert** - This is a work-in-progress, errors may exist in code"
+    type: primary
+    position: below-navbar
+    
+  chapters:
+    - index.qmd
+  
+    - part: surv_00_summ.qmd
+      chapters:      
+        - surv_01_kaplan.qmd
+        - surv_02_disctime.qmd
+        
+    - part: ccw_00_summ.qmd
+      chapters:
+        - ccw_01_intro.qmd
+        - ccw_02_est.qmd
+        - ccw_03_inf.qmd
+        - ccw_04_diag.qmd
+        - ccw_05_rep.qmd
+        
+    - part: app_00_summ.qmd
+      chapters:
+        - app_01_syndata.qmd
+        - app_02_boot.qmd
+        - app_03_speed.qmd
+        
+    - about.qmd
+
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    code-link: true
+    
+    author-meta: "Kevin W. McConeghy"
+    callout-appearance: simple
+  
+editor: source
+
+

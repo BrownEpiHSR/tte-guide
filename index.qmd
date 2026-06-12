@@ -1,0 +1,5 @@
+# Welcome! {.unnumbered} 
+
+This is the website for a guide to help researchers interested in applying target trial emulation methods, specifically use of the "clone-censor-weight" or CCW approach.  
+
+CCW is popular in the pharmacoepidemiology field, but its execution can be tricky. A TTE need not be done using CCW, but the approach is popular due to its flexibility. This website will provide a step-by-step guide on how to use this method. I also provide some in-depth discussions of particular aspects of the method, best practices, how to overcome common obstacles etc.

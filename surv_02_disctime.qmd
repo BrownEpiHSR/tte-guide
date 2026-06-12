@@ -1,0 +1,356 @@
+---
+title: "Parametric Discrete Time Analyses"
+bibliography: references.bib
+---
+
+```{r }
+#| label: setup
+#| echo: false
+#| message: false
+#| 
+library(here)
+library(ranger)
+
+source(here('scripts', 'setup.R'), echo=F)
+# Set seed for reproducibility
+set.seed(42)
+
+dta_c_panel = readRDS(here('dta', 'dta_cloned_panel.Rds')) 
+```
+
+# WORK IN PROGRESS
+
+# Introduction  
+
+Time is almost always discretely measured. 
+
+Although not directly related to target trial emulation or a clone-censor-weight approach, most TTE/CCW methods require a thorough understanding of how time to event analyses are executed, and in particular parametric discrete-time analyses. I cover some basic procedures and guidance here. There are a number of very comprehensive papers and textbooks which go into this topic.[@tutzdte2016;@discSurv]
+
+It is not necessarily the case that any given project will have a failure time (time to event) outcome, but it is quite common in my field and describes most research projects I am involved with so that is what I focus on.  
+
+## Time-to-event  
+
+It is assumed here that the basic measurement of the outcome includes a failure time (time at which follow-up ceases) and a binary indicator for whether the event occurred or not by that time point. The measure presumes a clear origin or time zero, and knowledge of the scale or unit of time (days, years etc.). In most applied work, the event can only occur once. For those with no observed event-time, meaning the event did not occur through the last-observable time point, the observed time is some other endpoint (death, administrative end, loss-to-follow-up), these non-events are referred to as "censored" meaning follow-up ceased at that time. The observed time for a person must be the minimum of event or censoring time.
+
+## Definitions and Notation  
+
+The outcome need not be death, but often is, and individuals must be alive to experience events, censoring etc. so most of the terminology and notation refer to "survival". 
+
+The letter T/t is typically used to denote time, where *T* may refer to total time observed, and *t* an individual time-period, $T = {1, ..., t}$. Since time is usually discretely defined, for example as days, then $t$ can be thought of as an interval, $t=1$ meaning from the end of the prior interval (day 0) through the next (but not including) interval, day 2. $T=t$ would mean a event or censor time occurred in interval $t$. A binary indicator for whether the event occured $E = {0, 1}$. 
+
+Survival probability, $S(t) = Pr(T>t)$, is the probability of survival beyond time-point *t*.
+
+Cumulative incidence, $R(t) = Pr(T<=t)$, is the 1-probability of survival, the probability the event occurred up to and including time-point *t*.
+
+Hazard, $h(t) = Pr(E_t=1|E_{t-1}=0)$, the probability of an event at time *t*, conditional on event-free survival up to that point, sometimes described as the "instantaneuous hazard".
+
+Cumulative Hazard, $H(t)$
+
+The terms are related, $S(t) = 1 – R(t)$. $h(t)=R(t)/S(t)$, $H(t) = -log[S(t)]$ and $S(t) = e –H(t)$. 
+
+# Data  
+
+Proper setup of the data is key here, the data is a person-period dataset. Where each row represents an interval of time for a person (or other observation unit). I make it simpler by having the unit of time interval be consistently 1. However, this is not actually strictly required. The time intervals can be uneven, like days 1-2, 3-7, 10-20 etc. So for each person there is a record `id`, a `time` variable, and an indicator for it a person censors `censor` or experiences the `event` during a period. The `enter`, `exit` variables can be important if the time units are intervals (e.g. 30-day) or uneven. Some variables like `age` may be fixed at the baseline time zero value, while others like `X_t` vary across time. 
+
+::: callout-note
+It is important to be consistent in your rules about whether `event` is counted at the beginning or end of an interval. I typically use of the end, `exit` time. This can get tricky when the interval is wide, like 30 days and you will have ties where people experience events, are censored or treated all in the same interval period.
+:::
+
+```{r }
+#| label: data-look
+#| echo: false
+#| message: false
+glimpse(dplyr::filter(dta_c_panel, model=='ay') %>%
+  select(id, time, censor, event, enter, exit, age, X, X_t))
+```
+
+# Regression  
+
+The following may generically be referred to as 'outcome' models to distinguish them from the weight estimation step (which also may perform similar analyses) in the clone-censor-weight approach.  
+
+## Pooled Logistic Regression  
+
+::: callout-note
+Pooled logistic regression is an important statistical model for target trial emulation because of its flexibility in estimating weights for time-varying confounding and the estimation of cumulative incidences. The PLR model approximates the hazards with some assumptions, see Technical Point 17.1 on page 227 of [Causal Inference: What If](https://www.hsph.harvard.edu/miguel-hernan/wp-content/uploads/sites/1268/2024/04/hernanrobins_WhatIf_26apr24.pdf), which explains why the odds approximates the hazard at a given time-point *k*, with weak assumption the hazard is small (i.e. rare event) at time *k*.
+:::
+
+The PLR model estimates the person-period conditional probability of an event, and the cumulative incidence or event-free survival probability can be estimated by taking the cumulative product of each person-period. since there is a conditional probability for each person-period, this approach can flexibly accommodate complex models of both time-fixed and varying variables (its primary appeal).  
+
+A key model term(s) is time, which can be parameterized in arbitrarily complex ways. Simple linear terms, polynomials, splines etc. Additionally, the model need not be a logistic family, it can also be a complementary log-log or Gompertz model. A few of these choices are compared below, but the synthetic data was generated with a polynomial term for time and logit link function.
+
+## GLM model  
+
+### Model Estimation  
+
+Estimating the GLM model is straightforward if the data is properly setup.  
+
+```{r }
+#| label: glm-mod
+#| message: false
+ 
+d_glm = glm(event==0 ~ poly(time, 2, raw=T)*assign, data=dta_c_panel, family=binomial(), model=F)
+```
+
+To experiment with model parameters later on a function is used.  
+
+```{r }
+#| label: glm-func
+#| echo: true
+#| eval: false
+
+# tfun = A model specification for the time function
+# i_covars = a character vector of covariates to adjust for
+# modstrat = Whether to stratify the model by assignment or not
+# ...; Other glm() parameters like `family()` to provide
+
+f_dtmod(dta_c_panel, family = binomial()) 
+```
+
+Once the model is estimated, the conditional probabilities are estimated for the original dataset, and cumulative survival or incidence of the event is computed from this.  
+
+### Cumulative Incidence  
+
+```{r }
+#| label: cuminc-est
+#| echo: true
+#| eval: false
+#| 
+  dta_c_panel$pr_surv = predict(d_glm, newdata = dta_c_panel, type = 'response') 
+  
+  dta_c_panel %>%
+    group_by(assign, id) %>%
+    mutate(pr_cumsurv = cumprod(pr_surv),
+           pr_cumev = 1 - pr_cumsurv) %>% 
+    ungroup %>% 
+    group_by(assign, time) %>%
+    summarize(pr_cumsurv = mean(pr_cumsurv),
+           pr_cumev = 1 - mean(pr_cumsurv), .groups = 'drop') %>% 
+    ungroup %>%
+    pivot_wider(., id_cols =c('time'), 
+                names_from = assign,
+                names_prefix = 'pr_ev_', 
+                values_from = pr_cumev 
+    ) %>%
+    mutate(cid = pr_ev_1 - pr_ev_0, 
+           cir = pr_ev_1 / pr_ev_0)
+  
+# `f_cuminc()` is a helper function to compute this step
+```
+
+
+
+```{r }
+#| label: plr-naive-est
+d_mods_pnl = dta_c_panel %>%
+  nest(data = -model) %>%
+  mutate(est_plr_nv = 
+           map(data, 
+               function(x) {
+                 d_glm = f_dtmod(x, family = binomial()) # <1>
+                 x$pr_surv = predict(d_glm, newdata = x, type = 'response') # <2>
+                 f_cuminc(x) # <3>
+                 }))
+```
+
+1.  PLR model, with time\*treat interaction. Binomial family for logistic regression.
+2. Fit the conditional probabilities back to the original dataset.
+3.  The cumulative incidence is 1 - cumulative event-free survival probability. To compute, you take the cumulative product by assignment group. Reorganize data and summarize by group/time .
+
+```{r }
+#| label: gg-plr-naive
+#| fig-cap-location: top
+#| echo: false
+#| fig-cap: "Figure 2. Unadjusted, unweighted cumulative incidences by treatment group (PLR)"
+#| fig-subcap: 
+#|  - 'A causes Y'
+#|  - 'A not a cause of Y'
+#| layout-ncol: 2
+#| message: false
+#| warning: false
+
+d_gg = mutate(d_mods_pnl, km_gg = map(est_plr_nv, function(x) {
+    x %>%
+      pivot_longer(cols = c(pr_ev_0, pr_ev_1), names_to = 'assign', values_to = 'pr_ev') %>%
+      ggplot(aes(x=time, y = pr_ev, color = assign)) +
+      geom_line(aes(linetype=assign), linewidth=1.2) +
+      scale_color_manual(labels = c('Assign=0', 'Assign=1'), values = cbbPalette) +
+      scale_linetype_manual(labels = c('Assign=0', 'Assign=1'), values = c(1, 2)) +
+      scale_x_continuous(breaks = seq(0, 60, 6),
+                         limits = c(0, 60)) +
+      theme_bw() +
+      labs(x = 'Follow-up', y = 'Cumulative incidence')
+  }))
+    
+d_gg$km_gg[[1]] # A -> Y
+
+d_gg$km_gg[[2]] # X -> Y
+```
+
+## Modifications to the GLM model
+
+There are options that can be explored to the basic binomial model. One is using the complementary log-log link instead of logit.  
+
+```{r }
+#| label: glm-mods-cloglog
+#| message: false
+ d_mods_pnl = d_mods_pnl %>%
+  mutate(est_plr_cloglog = 
+           map(data, 
+               function(x) {
+                 d_glm = f_dtmod(x, family = binomial(link = "cloglog")) # <1>
+                 x$pr_surv = predict(d_glm, newdata = x, type = 'response') # <2>
+                 f_cuminc(x) # <3>
+                 }))
+
+```
+
+The other is modifying the time function. For example, using splines:  
+
+```{r }
+#| label: glm-mods-spline
+#| message: false
+ d_mods_pnl = d_mods_pnl %>%
+  mutate(est_plr_spline = 
+           map(data, 
+               function(x) {
+                 d_glm = f_dtmod(x, tfun = 'splines::bs(time, df=6)', 
+                                 family = binomial()) # <1>
+                 x$pr_surv = predict(d_glm, newdata = x, type = 'response') # <2>
+                 f_cuminc(x) # <3>
+                 }))
+
+```
+Because the synthetic data in this example was generating using simple functions, these choices will not yield very different estimates. However, in applied work these choices could significantly impact the findings and should be compared like here:
+
+```{r }
+#| label: glm-table
+#| echo: false
+#| message: false
+
+d_summ = d_mods_pnl %>%
+  rename(Data = model) %>%
+  select(-data) %>%
+  pivot_longer(., cols = c(starts_with('est_')), names_to = 'Model', values_to = 'table') %>%
+  unnest(cols = c(table)) %>%
+  dplyr::filter(time %in% c(6, 12, 36, 60)) %>%
+  mutate(GLM = case_when(
+    Model == 'est_plr_nv' ~ 'Logit, Poly(time, degree=2)',
+    Model == 'est_plr_cloglog' ~ 'CLOGLOG, Poly(time, degree=2)',
+    Model == 'est_plr_spline' ~ 'Logit, Spline(time, df=6)'
+  ))
+
+  
+
+t_summ_all = kables(caption = 'X causes {A, Y}, A does not cause Y',
+  list(d_summ %>%
+         dplyr::filter(Data == 'xy') %>%
+         pivot_wider(., id_cols = time, names_from = GLM, values_from = cid) %>%
+         kable(digits=3, align = 'c') %>%
+         kable_styling() %>%
+         add_header_above(., c("Risk Differences" = 4)),
+       d_summ %>%
+         dplyr::filter(Data == 'xy') %>%
+         pivot_wider(., id_cols = time, names_from = GLM, values_from = cir) %>%
+         kable(digits=3, align = 'c') %>%
+         kable_styling() %>%
+         add_header_above(., c("Relative Risks" = 4))
+       )
+  )
+
+t_summ_all
+```
+
+# Other modeling approaches
+
+## Machine learning algorithms
+
+An alternative to regression would be use of random forests. If you wanted to compare to Kaplan-Meier you could use the `randomforestSRC` package. But I compare the logistic models above to a random forest classifier. A  support vector classifier could work well in theory, but in practice most CCW datasets are too large and they become computationally difficult.
+
+```{r }
+#| label: inst-ml-pckgs
+#| eval: false
+#| message: false
+
+library(ranger)
+```
+
+### Machine Learners    
+
+Random forest methods are a complex topic, and training the models requires significant effort and practice. I perform a simple example below but any serious effort would require training, testing and validation to be credible.  
+
+```{r }
+#| label: train-svm
+#| message: false
+
+dta_ml = dta_c_panel %>% 
+    dplyr::filter(model == 'ay') %>% 
+    mutate(time = unlist(scale(time))) %>% # scaled timed
+    select(event, time, assign)
+
+# Logit 
+  glm_model = glm(event==0 ~ poly(time, 2, raw=T)*assign, data=dta_ml, family=binomial(), model=F) # <1>
+  dta_c_panel[dta_c_panel$model == 'ay', 'glm'] = predict(glm_model, type = 'response') # <1>
+
+# Random Forest
+  
+  
+  rf_model = ranger(event ~ time + assign, # <2>
+                    data=dta_ml, # <2>
+                    num.trees = 500, # <2>
+                    ) # <2>
+  
+  dta_c_panel[dta_c_panel$model == 'ay', 'rf'] <- 1 - predict(rf_model, data = dta_ml)$predictions
+```
+
+1. Logit model for comparison
+2. Random forest, using the `ranger()` function and package.
+
+### Calculate cumulative incidences 
+
+I just focus on the `ay` model for comparison:  
+
+```{r }
+#| label: ml-cuminc
+#| message: false
+
+est_rf = mutate(dta_c_panel, pr_surv = rf) %>%
+  dplyr::filter(model == 'ay') %>%
+  f_cuminc(.) %>%
+  dplyr::filter(time %in% c(6, 12, 36, 60)) %>%
+  mutate(Model = 'RF')
+
+est_glm = mutate(dta_c_panel, pr_surv = glm) %>%
+  dplyr::filter(model == 'ay') %>%
+  f_cuminc(.) %>%
+  dplyr::filter(time %in% c(6, 12, 36, 60)) %>%
+  mutate(Model = 'GLM')
+
+d_mods_pnl_2 = bind_rows(est_glm, est_rf) 
+```
+
+```{r }
+#| label: glm-table2
+#| echo: false
+#| message: false
+t_summ_all = kables(caption = 'X causes {A, Y}, A causes Y',
+  list(d_mods_pnl_2 %>%
+         pivot_wider(., id_cols = time, names_from = Model, values_from = cid) %>%
+         kable(digits=3, align = 'c') %>%
+         kable_styling() %>%
+         add_header_above(., c("Risk Differences" = 3)),
+       d_mods_pnl_2 %>%
+         pivot_wider(., id_cols = time, names_from = Model, values_from = cir) %>%
+         kable(digits=3, align = 'c') %>%
+         kable_styling() %>%
+         add_header_above(., c("Relative Risks" = 3))
+       )
+  )
+
+t_summ_all
+```
+
+# References
+
+::: {#refs}
+
+:::

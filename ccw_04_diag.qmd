@@ -1,0 +1,325 @@
+---
+title: "Additional Topics"
+subtitle: "Sensitivity analyses and Troubleshooting"
+bibliography: references.bib
+---
+
+```{r }
+#| label: setup
+#| echo: false
+#| message: false
+
+library(here())
+
+source(here('scripts', 'setup.R'), echo=F)
+# Set seed for reproducibility
+set.seed(42)
+
+#increase size for bootstrapping procedure
+  options(future.globals.maxSize = 4000*1024^2) 
+
+dta_c_panel = readRDS(here('dta', 'dta_cloned_panel.Rds')) 
+
+dta_c_person = readRDS(here('dta', 'dta_cloned_person.Rds')) 
+
+```
+
+## Evaluation of Grace Period {#sec-gracediag}
+
+The selection of a grace period is ideally based on knowledge of the treatment in real-world use. For example, if there were treatment guidelines recommending an intervention take place within a specific time-frame (6 weeks from hospital discharge, 1 hour from presentation in the ED etc.), then it makes sense to follow that recommendation in selecting a grace period. However, practical limitations may change this for a project. Even though it may be recognized that 6 weeks is recommended, maybe very few initiate that early and 12 weeks captures more treated cases.
+
+Whatever period is selected, a sound practice is to evaluate how different results appear when different grace periods are selected. It is simplest when the time-frame doesn't change the estimated effect very much, but a variety of things could impact this. For example, if probability of initiation of treatment varies widely across time due to confounding or some general time-trend then selecting different grace windows could substantially change results. Additionally, if the many events occur early after time-zero, then grace windows will count most of these events in both arms so your estimate of treatment grace period effects could be more conservative than actual treatment initiation. 
+
+::: callout-note
+Another way of thinking about these issues of how to define treatment, grace periods etc. is in terms of *relevance*. Your defined intervention must be relevant to the risk for disease, and treatment strategies that are actually used in the real-world. 
+:::
+
+### Alternative grace periods 
+
+The original dataset is setup with a 12-unit grace period, I create two new datasets with 6 and 18-unit grace periods for comparison. A helper function for this is in the '~\scripts\macros\ folder: `mk_grace_chk.R`. For brevity, I only use the `ay` dataset, where treatment has a causal effect on Y. 
+
+```{r }
+#| label: gperiod-setup
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 1. Grace Period Comparison"
+#| fig-cap-location: top
+#| 
+dta = readRDS(here('dta', 'dta_cohort.Rds')) %>%
+  dplyr::filter(model=='ay')
+
+# Using purrr `map` with helper functions for brevity
+d_gg = tibble(Grace = c(6, 12, 18)) %>%
+  mutate(dta = map(.x = Grace, .f = ~f_clonedta(dta, grace=.))) %>%
+  mutate(km = map(.x = dta, .f = ~f_km_cuminc(.))) %>%
+  select(-dta) %>%
+  unnest(., cols = c(km)) %>%
+  mutate(Grace = factor(Grace))
+
+ggplot(data = d_gg, aes(x = time, y = cid)) +
+  geom_line(aes(color = Grace, linetype=Grace), size=1.1) +
+  scale_y_continuous(limits = c(-0.04, 0.04)) +
+  scale_color_manual(values = cbbPalette) +
+  scale_x_continuous(breaks = seq(0, 60, 6), limits = c(0, 60)) +
+  theme_minimal() +
+  labs(x = 'Time period', y = 'Cumulative Incidence')
+```
+*Description.* Each line presents the cumulative risk difference across time, using different definitions of the treatment intervention. In this case, it makes little difference, which is sensible because the synthetic data did not generate time-varying risks for the outcome or treatment initiation. 
+
+## Model testing
+
+### Examination of time function {#sec-tfunc}
+
+It is important to explore the data with a "naive" estimator. This is useful for the following reasons:
+
+1)  It allows examination of the overall time trends, censoring and sample size which can reveal fatal issues with the target trial emulation. For example, treatment is too rare in the grace window used, or event rate is unexpectedly high or low.
+
+2)  The non-parametric model allows a visual examination of the cumulative incidences (or event free survival probabilities) which are modeled parametrically in the pooled logistic regression. In other words, examining the time trend can help you determine if a simple polynomial or some more complex spline function is needed. This is not definitive however, because time-varying weights may change the time trends. But in my experience the unweighted curves provide a good starting point, and practitioners should be skeptical of a weighted analysis that shows dramatically different time trends then the unweighted analysis (likely to be poorly fit model).
+
+The [Kaplan-Meier Estimator](surv_01_kaplan.qmd) section provides a working example on fitting a simple naive estimator. Here a helper function `f_km_cuminc()` is used for brevity.
+
+#### Naive Kaplan-Meier Estimator
+
+```{r }
+#| label: gg-km
+#| fig-cap: "Figure 1. Naive Kaplan-Meier Estimator"
+#| fig-subcap: 
+#|  - 'A causes Y'
+#|  - 'A not a cause of Y'
+#| layout-ncol: 2
+#| fig-cap-location: top
+#| message: false
+#| warning: false
+#| echo: false
+  
+d_mods =  nest(dta_c_person, c(-model)) %>%
+  mutate(est_km = map(.x = data, .f = ~f_km_cuminc(.))) %>%
+  mutate(km_gg = map(.x = data, ~survfit2(Surv(time, event) ~ assign, data=.) |>
+                       ggsurvfit(type = 'risk', linewidth = 1) +
+                       add_risktable(risktable_stats = "{n.risk} ({cum.event})") +
+                      scale_ggsurvfit(x_scales = list(breaks = seq(0, 60, 10)), 
+                                     y_scales = list(limits = c(0, 1))) +
+                       scale_color_manual(values = cbbPalette) +
+                       labs(x = 'Follow-up'))
+         )
+
+d_mods$km_gg[[1]] # A-> Y
+
+d_mods$km_gg[[2]] # X -> Y
+
+```
+
+#### Naive PLR estimator
+
+Next, we proceed to essentially replicate the finding of the KM estimator with a PLR model. No weights or covariate-adjustment is applied yet. The weighting is computationally intensive and so this step is important to test your code. The goal is to ensure you have a good starting parametric model for the outcome to avoid complications when you add weights. An unadjusted PLR model should closely approximate the KM curves, if it doesn't then something is wrong. Either the time function is misspecified, data is too sparse (few events, follow-up exposure time etc.), or the code is wrong. 
+
+The [Discrete Time Estimator](surv_02_disctime.qmd) section provides a working example. Here a helper function `f_plr_cuminc()` is used for brevity.
+
+The PLR model requires specification of a function of time. Many start with a quadratic polynomial (i.e. time + time\^2). In my own work, I have found this insufficient, and interestingly have found that linear splines work the best. You must decide for yourself. You could compute AIC or some other model fit statistic to select it empirically. I often compare the PLR estimates to the non-parametric estimates for validity. However this doesn't completely avoid issues, because the weighted estimates (time-varying covariates, interactions with time etc.) could conceivably diverge quite a bit from the unadjusted KM estimator. You can either estimate the outcome in a model with both clones combined in one dataset OR estimate cumulative incidences separately (two models with data limited to `assign==1` & `assign==0` respectively). In the combined data, you must specify an interaction between treatment (clone assignment) and f(time), e.g. `time + time^2 + treat + treat*time + treat*time^2`, shorthand below is `poly(time, 2, raw=T)*assign`.
+
+```{r }
+#| label: gg-plr-naive
+#| fig-cap-location: top
+#| echo: false
+#| fig-cap: "Figure 2. Unadjusted, unweighted cumulative incidences by treatment group (PLR)"
+#| fig-subcap: 
+#|  - 'A causes Y'
+#|  - 'A not a cause of Y'
+#| layout-ncol: 2
+#| message: false
+#| warning: false
+d_mods_pnl = dta_c_panel %>%
+  nest(data = -model) %>%
+  mutate(est_plr_nv = map(data, ~f_plr_cuminc(.)), 
+         km_gg = map(est_plr_nv, function(x) {
+           x %>%
+      pivot_longer(cols = c(pr_ev_0, pr_ev_1), names_to = 'assign', values_to = 'pr_ev') %>%
+      ggplot(aes(x=time, y = pr_ev, color = assign)) +
+      geom_line(aes(linetype=assign), linewidth=1.2) +
+      scale_color_manual(labels = c('Assign=0', 'Assign=1'), values = cbbPalette) +
+      scale_linetype_manual(labels = c('Assign=0', 'Assign=1'), values = c(1, 2)) +
+      scale_x_continuous(breaks = seq(0, 60, 6),
+                         limits = c(0, 60)) +
+      theme_bw() +
+      labs(x = 'Follow-up', y = 'Cumulative incidence')
+  }))
+
+d_mods_pnl$km_gg[[1]] # A -> Y
+
+d_mods_pnl$km_gg[[2]] # X -> Y
+```
+
+```{r }
+#| label: gg-cmp-naive-models
+#| fig-cap-location: top
+#| fig-cap: "Figure 3. Comparison of Naive PLR versus KM estimator"
+#| fig-subcap: 
+#|  - 'A causes Y'
+#|  - 'A not a cause of Y'
+#| layout-ncol: 2
+#| message: false
+#| warning: false
+
+d_ci_cmp = bind_rows(
+  select(d_mods, model, est_km) %>% unnest(cols = c(est_km)) %>%
+    mutate(Est = 'KM-Naive') %>%
+    select(model, Est, time, pr_ev_1, pr_ev_0, cid),
+  select(d_mods_pnl, model, est_plr_nv) %>% unnest(cols = c(est_plr_nv)) %>%
+    mutate(Est = 'PLR-Naive') %>%
+    select(model, Est, time, pr_ev_0, pr_ev_1, cid)
+) %>%
+    pivot_longer(cols = c(pr_ev_0, pr_ev_1), names_to = 'assign', 
+                 names_prefix = 'pr_ev_', values_to = 'pr_ev') %>%
+  nest(data = -model)
+  
+d_gg = mutate(d_ci_cmp, km_gg = map(data, function(x) {
+    d_gg_ci = x %>%
+      ggplot(aes(x=time, color = Est, Group = Est)) +
+      geom_line(aes(y = pr_ev, linetype=assign), linewidth=0.9) +
+      scale_x_continuous(breaks = seq(0, 60, 6),
+                         limits = c(0, 60)) +
+      scale_color_manual(values = cbbPalette) +
+      theme_bw() +
+      labs(x = '', y = 'Cumulative incidence') 
+    
+d_gg_rr = x %>%
+        ggplot(aes(x=time, color = Est, Group = Est)) +
+        geom_line(aes(y = cid), linewidth=1.1) +
+        scale_x_continuous(breaks = seq(0, 60, 6),
+                           limits = c(0, 60)) +
+        scale_color_manual(values = cbbPalette) +
+        theme_bw() +
+        labs(x = 'Follow-up', y = 'Risk Differences') 
+   
+   ggarrange(d_gg_ci, d_gg_rr, nrow=2, common.legend = T)
+  }))
+    
+d_gg$km_gg[[1]] # A -> Y
+
+d_gg$km_gg[[2]] # X -> Y
+```
+
+So the PLR model using a simple polynomial approximates the KM estimator reasonably well. At this point it would be a project specific judgement whether to accept this, or test out other parametric functions. Consider the following regarding the parametric time trend:
+
+1.  It may not matter if PLR and KM are mildly inconsistent at certain time-points if the plan is to summarize the results at other periods (e.g. early versus later period estimates).
+
+2.  The non-parametric KM estimator may be imprecise with small sample sizes and/or rare outcomes. The risk difference estimates at each time-point may have considerable random variation, and the parametric model is essentially smoothing out this noise. So while they should be approximately the same, you do not want to overfit the noise of the KM estimator.
+
+3.  These initial steps will not guarantee a good fit after weighting is applied, it is only a first-look for diagnostic purposes.
+
+4. If the fit is not satisfying, then simply pick a different function of time. Many others to choose from, basis splines, `bs::splines(time, df=6, degree=1)`, or you can use a `mgcv()` for penalized splines etc. Also, consider specifying knots at specific time-points like the end of a grace period. 
+
+::: callout-note
+Note the outcome regression without weights is just for comparison and understanding, the final analysis must include probability weights for artificial censoring even if no confounding.
+:::
+
+#### Objective evaluation of the function of time  
+
+A subjective visual examination to determine the best functional form may be unappealing to some, but you could also compare different curves and rank them by bias/error relative to non-parametric. In [Fitting cumulative incidence curves](app_04_curvefit.qmd) I show how this can be done. 
+
+## Evaluation of Probability Weights {#sec-ipwdiag}
+
+For below we evaluate the causal A-> Y data.  
+
+```{r }
+#| label: est-wts
+#| echo: false
+
+dta_ay = dta_c_panel %>%
+  dplyr::filter(model == 'ay')
+
+dta_cens = dta_ay[dta_ay$assign==0, ]
+
+# assign == 0
+  d_glm_cwt_num = glm(treat ~ poly(time, 2, raw=T), data=dta_cens, family=binomial()) # <1>
+  
+  d_glm_cwt_den = glm(treat ~ poly(time, 2, raw=T) + X + X_t + poly(age, 2) + female, # <1>
+                 data=dta_cens, family=binomial()) # <1>
+
+  dta_ay$pr_cens_num = predict(d_glm_cwt_num, newdata = dta_ay, type='response') # <2>
+  dta_ay$pr_cens_den = predict(d_glm_cwt_den, newdata = dta_ay, type='response') # <2>
+  
+dta_cens_grace = dta_cens %>% # <1>
+    dplyr::filter(time==12 & t_treat>=12) #<1>
+  
+  d_glm_grace_num = glm(treat ~ 1, data=dta_cens_grace, family=binomial()) # <2>
+  
+  d_glm_grace_den = glm(treat ~ X + X_t + poly(age, 2) + female, # <2>
+                 data=dta_cens_grace, family=binomial()) # <2>
+  
+  dta_ay$pr_grace_num = predict(d_glm_grace_num, newdata = dta_ay, type='response') 
+  dta_ay$pr_grace_den = predict(d_glm_grace_den, newdata = dta_ay, type='response') 
+  
+setDT(dta_ay)
+  
+  dta_ay[, ipw := fcase(
+    assign==0, 1 / (1-pr_cens_den), # <1>
+    assign==0 & censor==1, 0, # <2>
+    assign==1 & censor==1, 0, # <2>
+    assign==1 & time < 12, 1, # <3>
+    assign==1 & time == 12  & t_treat  < 12, 1, # <4> 
+    assign==1 & time == 12  & t_treat  >=12, 1 / (pr_grace_den), # <5> 
+    assign==1 & time > 12, 1, # <6>
+    assign==1 & censor==1, 0
+  )]
+  
+dta_ay[, marg_c0  := 1-mean(censor), by = list(assign, time)] # <1>
+
+dta_ay[, marg_ipw := fcase(
+    assign==0, (marg_c0) / (1-pr_cens_den), # <1>
+    assign==0 & censor==1, 0, # <2>
+    assign==1 & censor==1, 0, # <2>
+    assign==1 & time < 12, 1, # <3>
+    assign==1 & time == 12  & t_treat  < 12, 1, # <4> 
+    assign==1 & time == 12  & t_treat  >=12, marg_c0 / (pr_grace_den), # <5> 
+    assign==1 & time > 12, 1, # <6>
+    assign==1 & censor==1, 0
+  )]
+```
+
+Examining the distribution of censoring weights is necessary to identify problems. Extreme weights take on new meaning in CCW designs because the probability of treatment initiation may be very small in discrete time windows. Therefore weights can be quite large. Truncation at the upper 1% is not generally recommended until careful examination of the distribution takes place.  
+
+### Overall IPW Distribution  
+
+```{r }
+#| label: desc-ipw
+#| echo: false
+summary(dta_ay$ipw, digits = 3)
+quantile(dta_ay$ipw, probs = c(0.95, 0.99, 0.995, 0.999))
+```
+
+It can be observed the median is ~1, and the mean is ~1, the data is skewed. 
+
+You can plot the counts across time for:
+
+```{r }
+#| label: desc-ipw-time
+#| fig-cap: Unstabilized weights across time
+#| fig-cap-location: top
+#| warning: false
+dta_ay %>%
+  group_by(assign, time) %>%
+  summarize(mean = mean(ipw), .groups = 'drop') %>%
+  mutate(assign = factor(assign)) %>%
+ ggplot(., aes(x = time, group = assign, color = assign)) +
+  geom_line(aes(y = mean, color = assign)) +
+  scale_color_manual( values = cbbPalette) +
+  geom_hline(aes(yintercept=1),linewidth=0.8, linetype=2) +
+  geom_hline(aes(yintercept=1.2),linewidth=0.8, linetype=3) +
+  geom_hline(aes(yintercept=0.8),linewidth=0.8, linetype=3) +
+  scale_x_discrete(labels = seq(0, 60, 12)) +
+  scale_y_continuous(limits = c(0.7, 1.3)) +
+  labs(x = "Follow-up", y = "Mean (Weights)") +
+  theme_bw()
+```
+
+#### Marginal Stabilized weights  
+
+```{r }
+#| label: desc-marg_ipw
+#| echo: false
+summary(dta_ay$marg_ipw, digits = 3)
+quantile(dta_ay$marg_ipw, probs = c(0.95, 0.99, 0.995, 0.999))
+```
+Stabilized weights should have a mean ~ 1.  
